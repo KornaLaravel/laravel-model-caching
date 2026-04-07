@@ -25,37 +25,47 @@ trait CreatesApplication
         return $this->makeCacheDeserializeProxy(store: $cache);
     }
 
+    protected function deserializeCacheValue(mixed $value): mixed
+    {
+        $prefix = ModelCacheRepository::SERIALIZED_VALUE_PREFIX;
+
+        if (
+            ! is_string(value: $value)
+            || ! str_starts_with(haystack: $value, needle: $prefix)
+        ) {
+            return $value;
+        }
+
+        return unserialize(
+            data: substr(string: $value, offset: strlen(string: $prefix)),
+            options: ["allowed_classes" => true],
+        );
+    }
+
     protected function makeCacheDeserializeProxy(object $store): object
     {
-        return new class($store)
+        $deserializer = fn (mixed $value): mixed => $this->deserializeCacheValue(value: $value);
+
+        return new class($store, $deserializer)
         {
-            public function __construct(private readonly object $store) {}
+            public function __construct(
+                private readonly object $store,
+                private readonly \Closure $deserializer,
+            ) {}
 
             public function __call(string $name, array $arguments): mixed
             {
                 $result = $this->store->{$name}(...$arguments);
 
                 if ($name === "get") {
-                    $prefix = ModelCacheRepository::SERIALIZED_VALUE_PREFIX;
-
-                    if (
-                        is_string(value: $result)
-                        && str_starts_with(haystack: $result, needle: $prefix)
-                    ) {
-                        return unserialize(
-                            data: substr(string: $result, offset: strlen(string: $prefix)),
-                            options: ["allowed_classes" => true],
-                        );
-                    }
-
-                    return $result;
+                    return ($this->deserializer)($result);
                 }
 
                 if (
                     is_object(value: $result)
                     && ($result instanceof Repository || method_exists(object_or_class: $result, method: "get"))
                 ) {
-                    return new self(store: $result);
+                    return new self(store: $result, deserializer: $this->deserializer);
                 }
 
                 return $result;
