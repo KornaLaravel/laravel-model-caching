@@ -25,6 +25,15 @@ trait CreatesApplication
         return $this->makeCacheDeserializeProxy(store: $cache);
     }
 
+    private function testDatabaseDirectory(): string
+    {
+        $token = env(key: "TEST_TOKEN");
+
+        return $token
+            ? __DIR__ . "/database/parallel-{$token}"
+            : __DIR__ . "/database";
+    }
+
     protected function deserializeCacheValue(mixed $value): mixed
     {
         $prefix = ModelCacheRepository::SERIALIZED_VALUE_PREFIX;
@@ -45,16 +54,29 @@ trait CreatesApplication
     protected function makeCacheDeserializeProxy(object $store): object
     {
         $deserializer = fn (mixed $value): mixed => $this->deserializeCacheValue(value: $value);
+        $workerFlush = function (): void {
+            $this->flushWorkerCacheKeys();
+        };
 
-        return new class($store, $deserializer)
+        return new class($store, $deserializer, $workerFlush)
         {
             public function __construct(
                 private readonly object $store,
                 private readonly \Closure $deserializer,
+                private readonly \Closure $workerFlush,
             ) {}
 
             public function __call(string $name, array $arguments): mixed
             {
+                if (
+                    $name === "flush"
+                    && ! ($this->store instanceof \Illuminate\Cache\TaggedCache)
+                ) {
+                    ($this->workerFlush)();
+
+                    return true;
+                }
+
                 $result = $this->store->{$name}(...$arguments);
 
                 if ($name === "get") {
@@ -65,7 +87,11 @@ trait CreatesApplication
                     is_object(value: $result)
                     && ($result instanceof Repository || method_exists(object_or_class: $result, method: "get"))
                 ) {
-                    return new self(store: $result, deserializer: $this->deserializer);
+                    return new self(
+                        store: $result,
+                        deserializer: $this->deserializer,
+                        workerFlush: $this->workerFlush,
+                    );
                 }
 
                 return $result;
@@ -79,7 +105,12 @@ trait CreatesApplication
 
         $this->setUpBaseLineSqlLiteDatabase();
 
-        $databasePath = __DIR__ . "/database";
+        $databasePath = $this->testDatabaseDirectory();
+
+        if (! is_dir(filename: $databasePath)) {
+            mkdir(directory: $databasePath, permissions: 0755, recursive: true);
+        }
+
         $this->testingSqlitePath = "{$databasePath}/";
         $baselinePath = "{$databasePath}/baseline.sqlite";
         $testingPath = "{$databasePath}/testing.sqlite";
@@ -95,7 +126,23 @@ trait CreatesApplication
         $this->cache = $this->makeCacheDeserializeProxy(
             store: app(abstract: "cache")->store(name: config(key: "laravel-model-caching.store")),
         );
-        $this->cache()->flush();
+        $this->flushWorkerCacheKeys();
+    }
+
+    protected function flushWorkerCacheKeys(): void
+    {
+        $token = (int) env(key: "TEST_TOKEN", default: 1);
+        $pattern = "lmc-test-{$token}:*";
+        $client = app(abstract: "redis")->connection(name: "model-cache")->client();
+        $cursor = null;
+
+        do {
+            $found = $client->scan($cursor, $pattern, 1000);
+
+            if (is_array(value: $found) && $found !== []) {
+                $client->del($found);
+            }
+        } while ($cursor > 0);
     }
 
     /**
@@ -116,7 +163,13 @@ trait CreatesApplication
 
         self::$baseLineDatabaseMigrated = true;
 
-        $file = __DIR__ . '/database/baseline.sqlite';
+        $databasePath = $this->testDatabaseDirectory();
+
+        if (! is_dir(filename: $databasePath)) {
+            mkdir(directory: $databasePath, permissions: 0755, recursive: true);
+        }
+
+        $file = "{$databasePath}/baseline.sqlite";
         $this->app['config']->set('database.default', 'baseline');
         $this->app['config']->set('database.connections.baseline', [
             'driver' => 'sqlite',
@@ -142,14 +195,21 @@ trait CreatesApplication
 
     protected function getEnvironmentSetUp($app)
     {
+        $token = (int) env(key: "TEST_TOKEN", default: 1);
+
         $app['config']->set('database.default', 'testing');
         $app['config']->set('database.connections.testing', [
             'driver' => 'sqlite',
-            'database' => __DIR__ . '/database/testing.sqlite',
+            'database' => $this->testDatabaseDirectory() . '/testing.sqlite',
             'prefix' => '',
             "foreign_key_constraints" => false,
         ]);
         $app['config']->set('database.redis.client', "phpredis");
+        $app['config']->set('database.redis.options', [
+            'cluster' => 'redis',
+            'prefix' => '',
+            'persistent' => false,
+        ]);
         $app['config']->set('database.redis.cache', [
             'host' => env('REDIS_HOST', '127.0.0.1'),
             'port' => env('REDIS_PORT', 6379),
@@ -167,6 +227,7 @@ trait CreatesApplication
         $app['config']->set('cache.stores.model', [
             'driver' => 'redis',
             'connection' => 'model-cache',
+            'prefix' => "lmc-test-{$token}:",
         ]);
         $app['config']->set('laravel-model-caching.store', 'model');
     }
