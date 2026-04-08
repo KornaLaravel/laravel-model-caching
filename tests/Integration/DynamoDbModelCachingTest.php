@@ -194,7 +194,9 @@ class DynamoDbModelCachingTest extends IntegrationTestCase
         ]);
 
         $freshAuthors = Author::query()->get();
-        $storedPayload = FakeDynamoDbStore::getStoredValue($hashedItemKey);
+        $storedPayload = $this->deserializeCacheValue(
+            value: FakeDynamoDbStore::getStoredValue($hashedItemKey),
+        );
 
         $this->assertEquals($expectedAuthors->pluck('id')->toArray(), $freshAuthors->pluck('id')->toArray());
         $this->assertSame($cacheKey, $storedPayload['key']);
