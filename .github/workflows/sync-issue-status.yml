@@ -14,6 +14,8 @@ on:
 
 jobs:
   sync:
+    permissions:
+      contents: read
     uses: GeneaLabs/.github/.github/workflows/sync-issue-status.yml@master
     with:
       pr_body: ${{ github.event.pull_request.body || '' }}
